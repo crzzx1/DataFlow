@@ -5,62 +5,96 @@ from dataflow.utils.registry import OPERATOR_REGISTRY
 from dataflow.utils.utils import get_logger
 from dataflow.utils.storage import DataFlowStorage
 
+
 @OPERATOR_REGISTRY.register()
 class PairQualFilter(OperatorABC):
-    def __init__(self, min_score=0, max_score=10000, model_cache_dir='./dataflow_cache', lang='en'):
-        self.logger = get_logger()
-        self.min_score = min_score
-        self.max_score = max_score
-        
-        self.scorer = PairQualSampleEvaluator(model_cache_dir=model_cache_dir, lang=lang)
-        self.filter_name = 'PairQualFilter'
+    """
+    DataFlow Operator：
+    - 从 storage 读 DataFrame
+    - 对 input_key 列打分（0–1）
+    - 写回 score_key 列并按区间过滤
+    """
 
-        self.logger.info(f"Initializing {self.filter_name} with min_score = {self.min_score}, max_score = {self.max_score}...")
+    def __init__(
+        self,
+        min_score: float = 0.0,           # 建议默认阈值
+        max_score: float = 1.0,           # Score 区间 [0,1]
+        model_cache_dir: str = "./dataflow_cache",
+        lang: str = "en",
+        device: str | None = None,        # "cpu"/"cuda"/None
+        input_key: str = "raw_content",
+        score_key: str = "PairQualScore",
+        batch_size: int = 8,
+    ):
+        self.logger = get_logger()
+
+        if not (0.0 <= min_score <= 1.0 and 0.0 <= max_score <= 1.0 and min_score <= max_score):
+            raise ValueError(
+                f"PairQualFilter expects scores in [0,1]. Got min_score={min_score}, max_score={max_score}."
+            )
+
+        self.min_score = float(min_score)
+        self.max_score = float(max_score)
+        self.input_key = input_key
+        self.score_key = score_key
+        self.batch_size = int(batch_size)
+
+        # 初始化评估器（工具类） ——— 注意缩进！
+        self.scorer = PairQualSampleEvaluator(
+            model_cache_dir=model_cache_dir,
+            lang=lang,
+            device=device,
+        )
+
+        self.filter_name = "PairQualFilter"
+        self.logger.info(
+            f"Initializing {self.filter_name} with min_score={self.min_score}, max_score={self.max_score}, "
+            f"input_key='{self.input_key}', score_key='{self.score_key}'."
+        )
 
     @staticmethod
     def get_desc(lang: str = "zh"):
         if lang == "zh":
             return (
-                "基于PairQualScorer打分器的得分对数据进行过滤。基于BGE模型，使用GPT对文本成对比较打分后训练而成的双语文本质量评分器，得分越高表示质量越高。\n"
-                "输入参数：\n"
-                "- min_score：最小质量得分阈值\n"
-                "- max_score：最大质量得分阈值\n"
-                "- model_cache_dir：模型缓存目录路径\n"
-                "- lang：文本语言类型\n"
-                "输出参数：\n"
-                "- 过滤后的DataFrame，仅保留质量得分在指定范围内的文本\n"
-                "- 返回包含质量得分字段名的列表"
+                "基于 PairQualScorer 的文本质量过滤算子，得分区间为 [0,1]，越高越好。\n"
+                "参数：min_score/max_score（区间内保留），model_cache_dir，lang（en/zh），device（cpu/cuda/None），"
+                "input_key（默认 raw_content），score_key（默认 PairQualScore）。"
             )
         else:
             return (
-                "Filter data using scores from the PairQualScorer. Bilingual text quality scorer trained on GPT pairwise comparison annotations using BGE model; higher scores indicate better quality.\n"
-                "Input Parameters:\n"
-                "- min_score: Minimum quality score threshold\n"
-                "- max_score: Maximum quality score threshold\n"
-                "- model_cache_dir: Model cache directory path\n"
-                "- lang: Text language type\n\n"
-                "Output Parameters:\n"
-                "- Filtered DataFrame containing only texts with quality score within specified range\n"
-                "- List containing quality score field name"
+                "PairQual-based quality filtering operator. Scores in [0,1], higher is better.\n"
+                "Params: min_score/max_score (keep inside range), model_cache_dir, lang (en/zh), "
+                "device (cpu/cuda/None), input_key (default raw_content), score_key (default PairQualScore)."
             )
 
-    def eval(self, dataframe, input_key):
-        self.logger.info(f"Start evaluating {self.filter_name}...")
-        
-        # Get the scores using the scorer
-        scores = self.scorer.eval(dataframe, input_key)
+    def run(self, storage: DataFlowStorage, input_key: str | None = None):
+        # 读取数据
+        df = storage.read("dataframe")
+        if df is None or df.empty:
+            self.logger.warning(f"{self.filter_name}: empty dataframe, skip.")
+            return [self.score_key]
 
-        # Return the scores for filtering
-        return np.array(scores)
+        col = input_key or self.input_key
+        if col not in df.columns:
+            self.logger.warning(f"{self.filter_name}: input_key '{col}' not found, skip.")
+            return [self.score_key]
 
-    def run(self, storage: DataFlowStorage, input_key: str, output_key: str='PairQualScore'):
-        self.input_key = input_key
-        self.output_key = output_key
-        dataframe = storage.read("dataframe")
-        self.logger.info(f"Running {self.filter_name} with input_key = {self.input_key} and output_key = {self.output_key}...")
-        scores = np.array(self.scorer.eval(dataframe, input_key))
-        dataframe[self.output_key] = scores
-        filtered_dataframe = dataframe[(scores >= self.min_score) & (scores <= self.max_score)]
-        storage.write(filtered_dataframe)
-        self.logger.info(f"Filtering completed. Total records passing filter: {len(filtered_dataframe)}.")
-        return [self.output_key]
+        # 打分（0–1）
+        try:
+            # 优先尝试带 batch_size（若 eval 支持）
+            scores = self.scorer.eval(df, col, batch_size=self.batch_size)
+        except TypeError:
+            # 兼容旧版不支持 batch_size 的实现
+            scores = self.scorer.eval(df, col)
+
+        scores = np.clip(scores, 0.0, 1.0)  # 保险裁剪
+        df[self.score_key] = scores
+
+        # 区间过滤
+        mask = (df[self.score_key] >= self.min_score) & (df[self.score_key] <= self.max_score)
+        kept = int(mask.sum())
+        self.logger.info(f"{self.filter_name}: keep {kept}/{len(df)} rows in [{self.min_score}, {self.max_score}].")
+
+        df = df[mask].reset_index(drop=True)
+        storage.write(df)
+        return [self.score_key]
